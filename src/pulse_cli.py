@@ -1,92 +1,127 @@
 import time
 import sys
-from pynvml import *
+import random
+import math
+from prometheus_client import start_http_server, Gauge
+
+# Prometheus Metrics
+GPU_UTIL = Gauge('gpu_utilization_percent', 'GPU SM Utilization', ['gpu_index', 'gpu_name'])
+MEM_UTIL = Gauge('gpu_memory_utilization_percent', 'GPU Memory Controller Utilization', ['gpu_index', 'gpu_name'])
+MEM_USED = Gauge('gpu_memory_used_gb', 'GPU Memory Used (GB)', ['gpu_index', 'gpu_name'])
+POWER_WATTS = Gauge('gpu_power_watts', 'GPU Power Usage (W)', ['gpu_index', 'gpu_name'])
+PCIE_TX = Gauge('gpu_pcie_tx_mb', 'GPU PCIe Transmit (MB/s)', ['gpu_index', 'gpu_name'])
+PCIE_RX = Gauge('gpu_pcie_rx_mb', 'GPU PCIe Receive (MB/s)', ['gpu_index', 'gpu_name'])
+
+# Try importing pynvml; if missing, we'll use Mock Mode
+try:
+    from pynvml import *
+    HAS_NVML = True
+except ImportError:
+    HAS_NVML = False
 
 def check_nvidia_driver():
-    """Verify that NVML can be initialized (driver is loaded)."""
+    """Verify that NVML can be initialized. Returns False if mock mode needed."""
+    if not HAS_NVML:
+        return False
     try:
         nvmlInit()
-        version = nvmlSystemGetDriverVersion()
-        print(f"✅ NVIDIA Driver Detected: {version.decode('utf-8')}")
         return True
-    except NVMLError as error:
-        print(f"❌ Failed to initialize NVML: {error}")
-        print("   - Is the NVIDIA driver installed?")
-        print("   - Try: sudo dnf install cuda-drivers")
+    except NVMLError:
         return False
 
-def get_gpu_metrics(handle):
-    """Fetch critical metrics for a single GPU."""
-    
-    # 1. Utilization (Compute & Memory Controller)
-    util = nvmlDeviceGetUtilizationRates(handle)
-    gpu_util = util.gpu       # SM Utilization (%)
-    mem_util = util.memory    # Memory Controller Utilization (%)
-    
-    # 2. Memory Usage (Capacity)
-    mem_info = nvmlDeviceGetMemoryInfo(handle)
-    mem_used_gb = mem_info.used / 1024**3
-    mem_total_gb = mem_info.total / 1024**3
-    
-    # 3. Power Usage
-    power_watts = nvmlDeviceGetPowerUsage(handle) / 1000.0
+def get_real_metrics(handle):
+    """Fetch real metrics from physical GPU."""
     try:
-        power_limit = nvmlDeviceGetEnforcedPowerLimit(handle) / 1000.0
-    except NVMLError:
-        power_limit = 0.0 # Default if unknown
+        util = nvmlDeviceGetUtilizationRates(handle)
+        mem_info = nvmlDeviceGetMemoryInfo(handle)
+        power = nvmlDeviceGetPowerUsage(handle) / 1000.0
+        
+        # PCIe throughput (TX/RX)
+        tx = nvmlDeviceGetPcieThroughput(handle, NVML_PCIE_UTIL_TX_BYTES) / 1024.0
+        rx = nvmlDeviceGetPcieThroughput(handle, NVML_PCIE_UTIL_RX_BYTES) / 1024.0
 
-    # 4. PCIe Throughput (TX = Transmit, RX = Receive)
-    # throughput is in KB/s
-    tx_mb = nvmlDeviceGetPcieThroughput(handle, NVML_PCIE_UTIL_TX_BYTES) / 1024.0
-    rx_mb = nvmlDeviceGetPcieThroughput(handle, NVML_PCIE_UTIL_RX_BYTES) / 1024.0
-    
-    # 5. Clock Speeds
-    graphics_clock = nvmlDeviceGetClockInfo(handle, NVML_CLOCK_GRAPHICS)
-    sm_clock = nvmlDeviceGetClockInfo(handle, NVML_CLOCK_SM)
+        return {
+            "gpu_util": util.gpu,
+            "mem_util": util.memory,
+            "mem_used": mem_info.used / 1024**3,
+            "mem_total": mem_info.total / 1024**3,
+            "power_watts": power,
+            "pcie_tx": tx,
+            "pcie_rx": rx
+        }
+    except NVMLError:
+        return None
+
+def get_mock_metrics(index, tick):
+    """Generate realistic fake metrics for testing without a GPU."""
+    # Simulate a training workload (sine wave)
+    load = (math.sin(tick * 0.5) + 1) / 2  # 0.0 to 1.0
     
     return {
-        "gpu_util": gpu_util,
-        "mem_util": mem_util,
-        "mem_used": mem_used_gb,
-        "mem_total": mem_total_gb,
-        "power_watts": power_watts,
-        "power_limit": power_limit,
-        "pcie_tx": tx_mb,
-        "pcie_rx": rx_mb,
-        "clock_graphics": graphics_clock,
-        "clock_sm": sm_clock
+        "gpu_util": int(load * 95) + random.randint(-2, 2),
+        "mem_util": int(load * 80) + random.randint(-5, 5),
+        "mem_used": 40 + (load * 20), # 40-60GB used
+        "mem_total": 80.0,            # H100 80GB
+        "power_watts": 100 + (load * 600), # 100-700W
+        "pcie_tx": 2000 + (load * 1000),
+        "pcie_rx": 4000 + (load * 2000)
     }
 
-def monitor_loop(interval=1.0):
-    """Continuously monitor and print metrics."""
-    device_count = nvmlDeviceGetCount()
-    print(f"🔍 Monitoring {device_count} GPU(s) - Press Ctrl+C to stop\n")
+def monitor_loop(mock_mode=False, port=8000):
+    """Main loop: Update Prometheus metrics + Print to CLI."""
     
+    # Start Prometheus Server
+    start_http_server(port)
+    print(f"🚀 Prometheus Metrics available at http://localhost:{port}/metrics")
+    
+    device_count = 1 if mock_mode else nvmlDeviceGetCount()
+    tick = 0
+
     try:
         while True:
-            # Clear screen (ANSI escape code)
+            # Clear screen for dashboard feel
             print("\033[2J\033[H", end="")
-            print(f"--- GPU Pulse (Interval: {interval}s) ---")
+            print(f"--- GPU Pulse (Mode: {'MOCK' if mock_mode else 'REAL'}) ---")
             
             for i in range(device_count):
-                handle = nvmlDeviceGetHandleByIndex(i)
-                name = nvmlDeviceGetName(handle).decode('utf-8')
-                metrics = get_gpu_metrics(handle)
-                
-                print(f"\nGPU [{i}]: {name}")
-                print(f"  ├── 🧠 Compute (SM):    {metrics['gpu_util']:>3}%  (Clock: {metrics['clock_sm']} MHz)")
-                print(f"  ├── 💾 Memory Ctrl:     {metrics['mem_util']:>3}%  (Used: {metrics['mem_used']:.1f}/{metrics['mem_total']:.1f} GB)")
-                print(f"  ├── ⚡ Power:           {metrics['power_watts']:.1f}W / {metrics['power_limit']:.1f}W")
-                print(f"  └── ↔️  PCIe (TX/RX):    {metrics['pcie_tx']:.1f} / {metrics['pcie_rx']:.1f} MB/s")
-            
-            time.sleep(interval)
+                if mock_mode:
+                    name = "NVIDIA H100 (Simulated)"
+                    metrics = get_mock_metrics(i, tick)
+                else:
+                    handle = nvmlDeviceGetHandleByIndex(i)
+                    name = nvmlDeviceGetName(handle).decode('utf-8')
+                    metrics = get_real_metrics(handle)
+
+                if metrics:
+                    # Update Prometheus
+                    GPU_UTIL.labels(i, name).set(metrics['gpu_util'])
+                    MEM_UTIL.labels(i, name).set(metrics['mem_util'])
+                    MEM_USED.labels(i, name).set(metrics['mem_used'])
+                    POWER_WATTS.labels(i, name).set(metrics['power_watts'])
+                    PCIE_TX.labels(i, name).set(metrics['pcie_tx'])
+                    PCIE_RX.labels(i, name).set(metrics['pcie_rx'])
+
+                    # CLI Output
+                    print(f"\nGPU [{i}]: {name}")
+                    print(f"  ├── 🧠 SM Util:      {metrics['gpu_util']:>3}%")
+                    print(f"  ├── 💾 Mem Util:     {metrics['mem_util']:>3}%  ({metrics['mem_used']:.1f} / {metrics['mem_total']:.1f} GB)")
+                    print(f"  ├── ⚡ Power:        {metrics['power_watts']:.1f} W")
+                    print(f"  └── ↔️  PCIe (TX/RX): {metrics['pcie_tx']:.0f} / {metrics['pcie_rx']:.0f} MB/s")
+
+            tick += 0.5
+            time.sleep(1.0)
             
     except KeyboardInterrupt:
-        print("\n🛑 Monitoring stopped.")
+        print("\n🛑 Stopping...")
 
 if __name__ == "__main__":
+    # Auto-detect mode
     if check_nvidia_driver():
-        monitor_loop()
+        print("✅ NVIDIA Driver detected. Running in REAL mode.")
+        monitor_loop(mock_mode=False)
         nvmlShutdown()
     else:
-        sys.exit(1)
+        print("⚠️  No NVIDIA GPU detected. Running in MOCK mode (Simulation).")
+        print("   (This allows testing logic on CPU-only servers)")
+        time.sleep(2)
+        monitor_loop(mock_mode=True)
