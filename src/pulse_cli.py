@@ -125,6 +125,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return f"""
         <html>
         <head>
+            <meta charset="utf-8">
             <title>GPU Pulse Dashboard</title>
             <meta http-equiv="refresh" content="1">
             <style>
